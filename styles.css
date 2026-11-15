@@ -101,7 +101,7 @@ label { display: block; font-size: 14px; color: var(--muted); margin-bottom: 4px
 tr.done .check { background: var(--accent); color: #fff; }
 .del-set { background: none; border: 0; color: var(--muted); font-size: 18px; padding: 4px; }
 
-.ex-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ex-head { display: flex; align-items: center; gap: 10px; }
 .ex-head h3 { margin: 0; }
 .badge { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 99px; background: var(--input); color: var(--muted); }
 .badge.pr { background: #fef3c7; color: #92400e; }
@@ -173,3 +173,15 @@ tr.done .check { background: var(--accent); color: #fff; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
 .chip { border: 1px solid var(--line); background: var(--card); border-radius: 99px; padding: 5px 12px; font-size: 14px; }
 .chip.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* Фото тренажёров */
+.thumb-btn { background: none; border: 0; padding: 0; flex: none; line-height: 0; }
+.thumb {
+  width: 48px; height: 48px; border-radius: 10px; flex: none;
+  object-fit: cover; background: var(--input);
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 20px; line-height: 1;
+}
+.thumb.small { width: 40px; height: 40px; font-size: 16px; }
+.thumb.no-photo { opacity: .55; border: 1px dashed var(--line); }
+.photo-full { display: block; width: 100%; max-height: 60vh; object-fit: contain; border-radius: 12px; background: var(--input); }

@@ -42,6 +42,91 @@ const save = () => localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 const exById = id => state.exercises.find(e => e.id === id);
 const exName = id => (exById(id) || { name: 'Удалённое упражнение' }).name;
 
+/* ================== Фото тренажёров (IndexedDB) ================== */
+
+const photoUrls = new Map(); // exId -> objectURL для показа
+
+function idb(mode, fn) {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open('gym-photos', 1);
+    open.onupgradeneeded = () => open.result.createObjectStore('photos');
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const tx = open.result.transaction('photos', mode);
+      const req = fn(tx.objectStore('photos'));
+      tx.oncomplete = () => { open.result.close(); resolve(req?.result); };
+      tx.onerror = () => reject(tx.error);
+    };
+  });
+}
+
+async function photoEntries() {
+  const [keys, vals] = await Promise.all([idb('readonly', s => s.getAllKeys()), idb('readonly', s => s.getAll())]);
+  return keys.map((k, i) => [k, vals[i]]);
+}
+
+function setPhotoUrl(exId, blob) {
+  if (photoUrls.has(exId)) URL.revokeObjectURL(photoUrls.get(exId));
+  if (blob) photoUrls.set(exId, URL.createObjectURL(blob)); else photoUrls.delete(exId);
+}
+
+async function savePhoto(exId, blob) {
+  await idb('readwrite', s => (blob ? s.put(blob, exId) : s.delete(exId)));
+  setPhotoUrl(exId, blob);
+}
+
+async function loadPhotos() {
+  try { for (const [k, v] of await photoEntries()) setPhotoUrl(k, v); }
+  catch (e) { console.error('Фото недоступны', e); }
+}
+
+// Уменьшаем фото с камеры (несколько МБ) до ~100 КБ
+function shrinkImage(file, max = 1024) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const k = Math.min(1, max / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(img.src);
+      c.toBlob(b => (b ? resolve(b) : reject(new Error('toBlob'))), 'image/jpeg', 0.75);
+    };
+    img.onerror = () => reject(new Error('Не удалось открыть изображение'));
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+// Открывает выбор: камера или галерея (телефон сам предложит варианты)
+function pickImage() {
+  return new Promise(resolve => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*';
+    input.onchange = async () => {
+      if (!input.files[0]) return resolve(null);
+      try { resolve(await shrinkImage(input.files[0])); }
+      catch { alert('Не удалось обработать фото.'); resolve(null); }
+    };
+    input.click();
+  });
+}
+
+const thumb = (exId, cls = 'thumb') => photoUrls.has(exId)
+  ? `<img class="${cls}" src="${photoUrls.get(exId)}" alt="">`
+  : `<span class="${cls} no-photo">📷</span>`;
+
+function showPhoto(exId) {
+  openModal(`
+    <h2>${esc(exName(exId))}</h2>
+    <img class="photo-full" src="${photoUrls.get(exId)}" alt="Фото тренажёра">
+    <div class="row" style="margin-top:12px">
+      <button class="btn grow" data-action="replace-photo" data-id="${exId}">📷 Заменить</button>
+      <button class="btn danger" data-action="remove-photo" data-id="${exId}">Удалить</button>
+    </div>
+    <button class="btn block" style="margin-top:8px" data-action="close-modal">Закрыть</button>`);
+}
+
 /* ================== Утилиты ================== */
 
 const $ = sel => document.querySelector(sel);
@@ -136,7 +221,8 @@ function viewWorkout() {
     return `
       <div class="card">
         <div class="ex-head">
-          <h3>${esc(exName(it.exId))}</h3>
+          <button class="thumb-btn" data-action="photo" data-id="${it.exId}" aria-label="Фото тренажёра">${thumb(it.exId)}</button>
+          <h3 class="grow">${esc(exName(it.exId))}</h3>
           <button class="btn small danger" data-action="remove-ex" data-i="${i}">Убрать</button>
         </div>
         <table class="sets">
@@ -238,6 +324,7 @@ function renderPicker() {
     .sort((a, b) => a.name.localeCompare(b.name, 'ru'));
   $('#picker-list').innerHTML = list.map(e => `
     <button class="list-item" data-action="add-ex" data-id="${e.id}" ${inWorkout.has(e.id) ? 'style="opacity:.5"' : ''}>
+      ${photoUrls.has(e.id) ? thumb(e.id, 'thumb small') : ''}
       <div class="grow"><div>${esc(e.name)}</div><div class="muted">${esc(e.group)}</div></div>
       <span>${inWorkout.has(e.id) ? '✓' : '＋'}</span>
     </button>`).join('') || '<div class="empty">Ничего не найдено</div>';
@@ -311,7 +398,7 @@ function showWorkout(id) {
     <p class="muted">${fmtDate(w.start)}, ${new Date(w.start).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })} · ${fmtMinutes(new Date(w.end) - new Date(w.start))} · ${fmtNum(workoutVolume(w))} кг</p>
     ${w.items.map(it => `
       <div class="card">
-        <h3>${esc(exName(it.exId))}</h3>
+        <div class="row">${photoUrls.has(it.exId) ? thumb(it.exId, 'thumb small') : ''}<h3 class="grow" style="margin:0">${esc(exName(it.exId))}</h3></div>
         ${it.sets.map((s, j) => `<div class="row between"><span class="muted">Подход ${j + 1}</span><span>${fmtNum(num(s.w))} кг × ${num(s.r)}</span></div>`).join('')}
       </div>`).join('')}
     ${w.note ? `<div class="card"><div class="muted">Заметка</div>${esc(w.note)}</div>` : ''}
@@ -417,6 +504,7 @@ function viewExercises() {
         const best = bestFor(e.id);
         return `
           <div class="list-item">
+            <button class="thumb-btn" data-action="photo" data-id="${e.id}" aria-label="Фото тренажёра">${thumb(e.id, 'thumb small')}</button>
             <div class="grow"><div>${esc(e.name)}</div>${best ? `<div class="muted">лучший 1ПМ ≈ ${fmtNum(best)} кг</div>` : ''}</div>
             <button class="btn small" data-action="edit-exercise" data-id="${e.id}">✎</button>
           </div>`;
@@ -424,17 +512,31 @@ function viewExercises() {
     }).join('')}`;
 }
 
+let pendingPhoto; // undefined — без изменений, Blob — новое фото, null — удалить
+
 function exerciseForm(ex, then = '') {
+  pendingPhoto = undefined;
   openModal(`
     <h2>${ex ? 'Изменить упражнение' : 'Новое упражнение'}</h2>
     <div class="stack">
       <div><label>Название</label><input id="ex-name" value="${esc(ex?.name || '')}" placeholder="Например, Жим Арнольда"></div>
       <div><label>Группа мышц</label><select id="ex-group">${GROUPS.map(g => `<option ${g === (ex?.group || pickerGroup) ? 'selected' : ''}>${g}</option>`).join('')}</select></div>
+      <div><label>Фото тренажёра</label><div id="form-photo"></div></div>
       <button class="btn primary block" data-action="save-exercise" data-id="${ex?.id || ''}" data-then="${then}">Сохранить</button>
       ${ex ? `<button class="btn danger block" data-action="delete-exercise" data-id="${ex.id}">Удалить упражнение</button>` : ''}
       <button class="btn block" data-action="close-modal">Отмена</button>
     </div>`);
-  setTimeout(() => $('#ex-name').focus(), 50);
+  renderFormPhoto(ex?.id);
+  if (!ex) setTimeout(() => $('#ex-name').focus(), 50);
+}
+
+function renderFormPhoto(exId) {
+  const url = pendingPhoto ? URL.createObjectURL(pendingPhoto) : (pendingPhoto === null ? null : photoUrls.get(exId));
+  $('#form-photo').innerHTML = url
+    ? `<img class="photo-full" src="${url}" alt=""><div class="row" style="margin-top:6px">
+         <button class="btn small grow" data-action="form-photo" data-id="${exId || ''}">📷 Заменить</button>
+         <button class="btn small danger" data-action="form-photo-remove" data-id="${exId || ''}">Удалить фото</button></div>`
+    : `<button class="btn block" data-action="form-photo" data-id="${exId || ''}">📷 Сфотографировать или выбрать</button>`;
 }
 
 /* ================== Настройки ================== */
@@ -457,8 +559,12 @@ function openSettings() {
     </div>`);
 }
 
-function exportData() {
-  const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+const blobToDataUrl = blob => new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(blob); });
+
+async function exportData() {
+  const photos = {};
+  try { for (const [k, v] of await photoEntries()) photos[k] = await blobToDataUrl(v); } catch { /* без фото */ }
+  const blob = new Blob([JSON.stringify({ ...state, photos }, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = `gym-backup-${new Date().toISOString().slice(0, 10)}.json`;
@@ -475,8 +581,13 @@ function importData() {
       const data = JSON.parse(await input.files[0].text());
       if (!Array.isArray(data.exercises) || !Array.isArray(data.workouts)) throw new Error('bad format');
       if (!confirm(`Найдено тренировок: ${data.workouts.length}. Заменить текущие данные?`)) return;
-      state = Object.assign(defaultState(), data);
-      save(); closeModal(); render();
+      const { photos = {}, ...rest } = data;
+      state = Object.assign(defaultState(), rest);
+      save();
+      await idb('readwrite', s => s.clear());
+      [...photoUrls.keys()].forEach(k => setPhotoUrl(k, null));
+      for (const [k, url] of Object.entries(photos)) await savePhoto(k, await (await fetch(url)).blob());
+      closeModal(); render();
     } catch { alert('Не удалось прочитать файл резервной копии.'); }
   };
   input.click();
@@ -534,28 +645,48 @@ const actions = {
   },
   'new-exercise': d => exerciseForm(null, d.then),
   'edit-exercise': d => exerciseForm(exById(d.id)),
-  'save-exercise': d => {
+  'save-exercise': async d => {
     const name = $('#ex-name').value.trim(), group = $('#ex-group').value;
     if (!name) return $('#ex-name').focus();
     let id = d.id;
     if (id) Object.assign(exById(id), { name, group });
     else { id = uid(); state.exercises.push({ id, name, group }); }
     if (d.then === 'add' && state.active) state.active.items.push(newItem(id));
+    if (pendingPhoto !== undefined) await savePhoto(id, pendingPhoto);
     save(); closeModal(); render();
   },
   'delete-exercise': d => {
     if (!confirm('Удалить упражнение? В истории оно останется как «Удалённое упражнение».')) return;
     state.exercises = state.exercises.filter(e => e.id !== d.id);
     state.templates.forEach(t => { t.exIds = t.exIds.filter(x => x !== d.id); });
+    savePhoto(d.id, null).catch(() => {});
     save(); closeModal(); render();
   },
+  'photo': async d => {
+    if (photoUrls.has(d.id)) return showPhoto(d.id);
+    const blob = await pickImage();
+    if (blob) { await savePhoto(d.id, blob); render(); }
+  },
+  'replace-photo': async d => {
+    const blob = await pickImage();
+    if (blob) { await savePhoto(d.id, blob); render(); showPhoto(d.id); }
+  },
+  'remove-photo': async d => {
+    if (!confirm('Удалить фото?')) return;
+    await savePhoto(d.id, null); closeModal(); render();
+  },
+  'form-photo': async d => { const b = await pickImage(); if (b) { pendingPhoto = b; renderFormPhoto(d.id); } },
+  'form-photo-remove': d => { pendingPhoto = null; renderFormPhoto(d.id); },
   'open-settings': openSettings,
   'save-settings': () => { state.settings.rest = Math.max(0, Math.round(num($('#set-rest').value))); save(); closeModal(); },
   'export': exportData,
   'import': importData,
   'reset': () => {
     if (!confirm('Точно удалить ВСЕ тренировки и упражнения?')) return;
-    state = defaultState(); save(); stopRest(); closeModal(); render();
+    state = defaultState(); save(); stopRest(); closeModal();
+    idb('readwrite', s => s.clear()).catch(() => {});
+    [...photoUrls.keys()].forEach(k => setPhotoUrl(k, null));
+    render();
   },
   'close-modal': closeModal,
 };
@@ -592,6 +723,7 @@ setInterval(() => {
 }, 1000);
 
 render();
+loadPhotos().then(render);
 
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
   navigator.serviceWorker.register('sw.js').catch(() => {});

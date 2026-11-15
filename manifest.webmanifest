@@ -1,0 +1,13 @@
+{
+  "name": "Мой зал — дневник тренировок",
+  "short_name": "Мой зал",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f1115",
+  "theme_color": "#16a34a",
+  "lang": "ru",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

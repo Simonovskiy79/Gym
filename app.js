@@ -377,7 +377,11 @@ function viewWorkout() {
       <div class="card warn">⚠️ Приложение открыто во вкладке Safari. На iPhone у вкладки и у иконки на экране «Домой» <b>разные хранилища</b>,
       а данные вкладки Safari может стереть через 7 дней без посещений. Установите приложение (Поделиться → «На экран „Домой“»)
       и записывайте тренировки только через иконку.</div>` : '';
-    return `${warn}
+    const lastBackup = state.settings.lastBackup;
+    const backupWarn = state.workouts.length && (!lastBackup || Date.now() - new Date(lastBackup) > 7 * 864e5) ? `
+      <div class="card warn row"><div class="grow">💾 ${lastBackup ? `Резервная копия не делалась с ${fmtDateShort(lastBackup)}` : 'Вы ещё ни разу не сохраняли резервную копию'}.</div>
+      <button class="btn small" data-action="export">Сохранить</button></div>` : '';
+    return `${warn}${backupWarn}
       <button class="btn primary block" data-action="start-empty">＋ Начать тренировку</button>
       ${last ? `<p class="muted" style="text-align:center">Последняя: ${fmtDate(last.start)} · ${esc(last.name)}</p>` : ''}
       <div class="section-title">Шаблоны</div>
@@ -801,14 +805,49 @@ async function storageInfo() {
 async function exportData() {
   const photos = {};
   try { for (const [k, v] of await photoEntries()) photos[k] = typeof v === 'string' ? v : await blobToDataUrl(v); } catch { /* без фото */ }
-  const blob = new Blob([JSON.stringify({ ...state, photos }, null, 2)], { type: 'application/json' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `gym-backup-${new Date().toISOString().slice(0, 10)}.json`;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  const name = `gym-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  backupFile = new File([JSON.stringify({ ...state, photos }, null, 2)], name, { type: 'application/json' });
+  // На iPhone удобнее «Поделиться» → «Сохранить в Файлы» / отправить себе в мессенджер
+  if (navigator.canShare?.({ files: [backupFile] })) {
+    openModal(`
+      <h2>Резервная копия готова</h2>
+      <p class="muted">Нажмите «Сохранить» и выберите <b>«Сохранить в Файлы»</b> (iCloud Drive) — или отправьте файл себе в мессенджер / на почту.
+      Размер: ${Math.max(1, Math.round(backupFile.size / 1024))} КБ.</p>
+      <button class="btn primary block" data-action="share-backup">📤 Сохранить</button>
+      <button class="btn block" style="margin-top:8px" data-action="download-backup">⬇ Скачать файлом</button>
+      <button class="btn block" style="margin-top:8px" data-action="close-modal">Закрыть</button>`);
+  } else {
+    downloadBackup();
+  }
+}
+
+let backupFile = null;
+
+function markBackedUp() {
   state.settings.lastBackup = new Date().toISOString();
   save();
+}
+
+function downloadBackup() {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(backupFile);
+  a.download = backupFile.name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  markBackedUp();
+}
+
+async function shareBackup() {
+  try {
+    await navigator.share({ files: [backupFile], title: 'Мой зал — резервная копия' });
+    markBackedUp();
+    closeModal();
+    render();
+  } catch (e) {
+    if (e.name !== 'AbortError') alert('Не получилось поделиться файлом. Попробуйте «Скачать файлом».');
+  }
 }
 
 function importData() {
@@ -953,6 +992,8 @@ const actions = {
   'open-settings': openSettings,
   'save-settings': () => { state.settings.rest = Math.max(0, Math.round(num($('#set-rest').value))); save(); closeModal(); },
   'export': exportData,
+  'share-backup': shareBackup,
+  'download-backup': downloadBackup,
   'import': importData,
   'reset': () => {
     if (!confirm('Точно удалить ВСЕ тренировки и упражнения?')) return;

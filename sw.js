@@ -1,4 +1,4 @@
-const CACHE = 'gym-v4';
+const CACHE = 'gym-v5';
 const FILES = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icon.svg'];
 
 self.addEventListener('install', e => {

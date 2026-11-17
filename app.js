@@ -86,9 +86,9 @@ const photoUrls = new Map(); // exId -> objectURL для показа
 
 function idb(store, mode, fn) {
   return new Promise((resolve, reject) => {
-    const open = indexedDB.open('gym-photos', 2);
+    const open = indexedDB.open('gym-photos', 3);
     open.onupgradeneeded = () => {
-      for (const name of ['photos', 'kv']) if (!open.result.objectStoreNames.contains(name)) open.result.createObjectStore(name);
+      for (const name of ['photos', 'kv', 'videos']) if (!open.result.objectStoreNames.contains(name)) open.result.createObjectStore(name);
     };
     open.onerror = () => reject(open.error);
     open.onsuccess = () => {
@@ -177,6 +177,8 @@ function pickImage() {
   });
 }
 
+const techBtn = exId => `<button class="tech-btn ${hasTechnique(exId) ? 'has' : ''}" data-action="technique" data-id="${exId}" aria-label="Видео техники">▶</button>`;
+
 const thumb = (exId, cls = 'thumb') => photoUrls.has(exId)
   ? `<img class="${cls}" src="${photoUrls.get(exId)}" alt="">`
   : `<span class="${cls} no-photo">📷</span>`;
@@ -189,6 +191,101 @@ function showPhoto(exId) {
       <button class="btn grow" data-action="replace-photo" data-id="${exId}">📷 Заменить</button>
       <button class="btn danger" data-action="remove-photo" data-id="${exId}">Удалить</button>
     </div>
+    <button class="btn block" style="margin-top:8px" data-action="close-modal">Закрыть</button>`);
+}
+
+/* ================== Видео техники ================== */
+
+const videoIds = new Set(); // упражнения, у которых есть своё видео (сами файлы читаем по требованию)
+let openVideoUrl = null;
+
+async function loadVideoIds() {
+  try { (await idb('videos', 'readonly', s => s.getAllKeys())).forEach(k => videoIds.add(k)); }
+  catch (e) { console.error('Видео недоступны', e); }
+}
+
+const hasTechnique = exId => videoIds.has(exId) || !!exById(exId)?.video;
+
+function youtubeInfo(url) {
+  const m = String(url || '').match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/|live\/))([\w-]{11})/);
+  return m ? { id: m[1], vertical: /\/shorts\//.test(url) } : null;
+}
+
+const MAX_VIDEO_MB = 150;
+
+function pickVideo() {
+  return new Promise(resolve => {
+    const input = filePicker('video/*');
+    input.onchange = () => {
+      const file = input.files[0];
+      input.remove();
+      if (!file) return resolve(null);
+      if (file.size > MAX_VIDEO_MB * 1024 * 1024) {
+        alert(`Видео слишком большое (${Math.round(file.size / 1048576)} МБ). Обрежьте его до короткого фрагмента — до ${MAX_VIDEO_MB} МБ.`);
+        return resolve(null);
+      }
+      resolve(file);
+    };
+    input.click();
+  });
+}
+
+async function saveVideo(exId, file) {
+  try {
+    if (file) {
+      await idb('videos', 'readwrite', s => s.put(new Blob([file], { type: file.type || 'video/mp4' }), exId));
+      if (!(await idb('videos', 'readonly', s => s.getKey(exId)))) throw new Error('видео не записалось');
+      videoIds.add(exId);
+      requestPersist();
+    } else {
+      await idb('videos', 'readwrite', s => s.delete(exId));
+      videoIds.delete(exId);
+    }
+    return true;
+  } catch (e) {
+    alert('Не удалось сохранить видео: ' + (e.message || e) + '\nВозможно, на телефоне мало места.');
+    return false;
+  }
+}
+
+async function showTechnique(exId) {
+  const ex = exById(exId);
+  if (!ex) return;
+  let ownSrc = null;
+  if (openVideoUrl) { URL.revokeObjectURL(openVideoUrl); openVideoUrl = null; }
+  if (videoIds.has(exId)) {
+    try {
+      const blob = await idb('videos', 'readonly', s => s.get(exId));
+      if (blob) ownSrc = openVideoUrl = URL.createObjectURL(blob);
+    } catch { /* не прочиталось */ }
+  }
+  const yt = youtubeInfo(ex.video);
+  const linkHtml = !ex.video ? '' : yt
+    ? `<div class="video-box ${yt.vertical ? 'vertical' : ''}"><iframe src="https://www.youtube-nocookie.com/embed/${yt.id}?playsinline=1&rel=0" allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen title="Видео техники"></iframe></div>
+       <a class="btn small ghost" href="${esc(ex.video)}" target="_blank" rel="noopener">Открыть в YouTube ↗</a>`
+    : `<a class="btn block" href="${esc(ex.video)}" target="_blank" rel="noopener">▶ Открыть видео ↗</a>`;
+  const query = encodeURIComponent(`${ex.name} техника выполнения`);
+
+  openModal(`
+    <h2>${esc(ex.name)} — техника</h2>
+    ${ownSrc ? `<video class="own-video" src="${ownSrc}" controls playsinline preload="metadata"></video>
+      <div class="row" style="margin:6px 0 12px"><button class="btn small grow" data-action="video-own" data-id="${exId}">🎥 Заменить своё видео</button>
+      <button class="btn small danger" data-action="video-own-remove" data-id="${exId}">Удалить</button></div>` : ''}
+    ${linkHtml}
+    ${!ownSrc && !ex.video ? '<p class="muted">Видео пока нет. Найдите ролик на YouTube и вставьте ссылку или прикрепите своё видео (например, снятое тренером).</p>' : ''}
+
+    <div class="section-title">Ссылка на видео</div>
+    <div class="row">
+      <input id="video-url" inputmode="url" placeholder="https://youtu.be/…" value="${esc(ex.video || '')}">
+      <button class="btn" data-action="video-paste" aria-label="Вставить из буфера">📋</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button class="btn primary grow" data-action="video-link-save" data-id="${exId}">Сохранить ссылку</button>
+      ${ex.video ? `<button class="btn danger" data-action="video-link-remove" data-id="${exId}">Убрать</button>` : ''}
+    </div>
+    <a class="btn block" style="margin-top:8px" href="https://www.youtube.com/results?search_query=${query}" target="_blank" rel="noopener">🔍 Найти на YouTube</a>
+    <p class="muted" style="font-size:13px">В YouTube нажмите «Поделиться» → «Копировать ссылку», вернитесь сюда и нажмите 📋.</p>
+    ${ownSrc ? '' : `<button class="btn block" data-action="video-own" data-id="${exId}">🎥 Своё видео — снять или выбрать</button>`}
     <button class="btn block" style="margin-top:8px" data-action="close-modal">Закрыть</button>`);
 }
 
@@ -311,7 +408,8 @@ function viewWorkout() {
         <div class="ex-head">
           <button class="thumb-btn" data-action="photo" data-id="${it.exId}" aria-label="Фото тренажёра">${thumb(it.exId)}</button>
           <h3 class="grow">${esc(exName(it.exId))}</h3>
-          <button class="btn small danger" data-action="remove-ex" data-i="${i}">Убрать</button>
+          ${techBtn(it.exId)}
+          <button class="icon-btn" data-action="remove-ex" data-i="${i}" aria-label="Убрать упражнение">✕</button>
         </div>
         <table class="sets">
           <thead><tr><th>#</th><th>Прошлый</th>${timed ? '<th>Мин</th><th>Сек</th>' : '<th>Вес</th><th>Повт.</th>'}<th></th><th></th></tr></thead>
@@ -627,6 +725,7 @@ function viewExercises() {
           <div class="list-item">
             <button class="thumb-btn" data-action="photo" data-id="${e.id}" aria-label="Фото тренажёра">${thumb(e.id, 'thumb small')}</button>
             <div class="grow"><div>${esc(e.name)}</div>${e.kind === 'time' ? '<div class="muted">на время</div>' : best ? `<div class="muted">лучший 1ПМ ≈ ${fmtNum(best)} кг</div>` : ''}</div>
+            ${techBtn(e.id)}
             <button class="btn small" data-action="edit-exercise" data-id="${e.id}">✎</button>
           </div>`;
       }).join('');
@@ -647,6 +746,7 @@ function exerciseForm(ex, then = '') {
         <option value="time" ${(ex?.kind || defaultKind('', ex?.group || pickerGroup)) === 'time' ? 'selected' : ''}>Только время</option>
       </select></div>
       <div><label>Фото тренажёра</label><div id="form-photo"></div></div>
+      ${ex ? `<button class="btn block" data-action="technique" data-id="${ex.id}">▶ Видео техники${hasTechnique(ex.id) ? ' ✓' : ''}</button>` : ''}
       <button class="btn primary block" data-action="save-exercise" data-id="${ex?.id || ''}" data-then="${then}">Сохранить</button>
       ${ex ? `<button class="btn danger block" data-action="delete-exercise" data-id="${ex.id}">Удалить упражнение</button>` : ''}
       <button class="btn block" data-action="close-modal">Отмена</button>
@@ -692,7 +792,7 @@ async function storageInfo() {
   try { photos = (await idb('photos', 'readonly', st => st.count())) || 0; } catch { /* нет доступа */ }
   const last = state.settings.lastBackup;
   const line = (k, v) => `<div class="row between"><span class="muted">${k}</span><span>${v}</span></div>`;
-  return line('Тренировок', state.workouts.length) + line('Фото тренажёров', photos)
+  return line('Тренировок', state.workouts.length) + line('Фото тренажёров', photos) + line('Своих видео', videoIds.size)
     + line('Запущено', isStandalone() ? 'как приложение ✓' : 'во вкладке браузера')
     + line('Защита от очистки', persisted ? 'включена ✓' : 'нет')
     + line('Резервная копия', last ? fmtDateShort(last) : 'ни разу');
@@ -739,8 +839,16 @@ async function clearPhotos() {
 
 /* ================== Модальное окно ================== */
 
-function openModal(html) { $('#sheet').innerHTML = html; $('#modal').classList.remove('hidden'); }
-function closeModal() { $('#modal').classList.add('hidden'); $('#sheet').innerHTML = ''; }
+function openModal(html) {
+  if (openVideoUrl && !html.includes(openVideoUrl)) { URL.revokeObjectURL(openVideoUrl); openVideoUrl = null; }
+  $('#sheet').innerHTML = html;
+  $('#modal').classList.remove('hidden');
+}
+function closeModal() {
+  $('#modal').classList.add('hidden');
+  $('#sheet').innerHTML = '';
+  if (openVideoUrl) { URL.revokeObjectURL(openVideoUrl); openVideoUrl = null; }
+}
 
 /* ================== Обработчики ================== */
 
@@ -804,6 +912,7 @@ const actions = {
     state.exercises = state.exercises.filter(e => e.id !== d.id);
     state.templates.forEach(t => { t.exIds = t.exIds.filter(x => x !== d.id); });
     savePhoto(d.id, null).catch(() => {});
+    if (videoIds.has(d.id)) saveVideo(d.id, null);
     save(); closeModal(); render();
   },
   'photo': async d => {
@@ -821,6 +930,26 @@ const actions = {
   },
   'form-photo': async d => { const b = await pickImage(); if (b) { pendingPhoto = b; renderFormPhoto(d.id); } },
   'form-photo-remove': d => { pendingPhoto = null; renderFormPhoto(d.id); },
+  'technique': d => showTechnique(d.id),
+  'video-paste': async () => {
+    try { $('#video-url').value = (await navigator.clipboard.readText()).trim(); }
+    catch { alert('Не удалось прочитать буфер обмена. Вставьте ссылку в поле вручную (долгое нажатие → «Вставить»).'); }
+  },
+  'video-link-save': d => {
+    const url = $('#video-url').value.trim();
+    if (url && !/^https?:\/\//i.test(url)) return alert('Ссылка должна начинаться с https://');
+    exById(d.id).video = url;
+    save(); render(); showTechnique(d.id);
+  },
+  'video-link-remove': d => { delete exById(d.id).video; save(); render(); showTechnique(d.id); },
+  'video-own': async d => {
+    const file = await pickVideo();
+    if (file && await saveVideo(d.id, file)) { render(); showTechnique(d.id); }
+  },
+  'video-own-remove': async d => {
+    if (!confirm('Удалить своё видео?')) return;
+    if (await saveVideo(d.id, null)) { render(); showTechnique(d.id); }
+  },
   'open-settings': openSettings,
   'save-settings': () => { state.settings.rest = Math.max(0, Math.round(num($('#set-rest').value))); save(); closeModal(); },
   'export': exportData,
@@ -828,6 +957,8 @@ const actions = {
   'reset': () => {
     if (!confirm('Точно удалить ВСЕ тренировки и упражнения?')) return;
     state = migrate({}); save(); stopRest(); closeModal();
+    idb('videos', 'readwrite', st => st.clear()).catch(() => {});
+    videoIds.clear();
     clearPhotos().finally(render);
   },
   'close-modal': closeModal,
@@ -869,7 +1000,7 @@ render();
 (async () => {
   if (await restoreFromBackupStore()) render();
   else save(); // создаём запасную копию для уже существующих данных
-  await loadPhotos();
+  await Promise.all([loadPhotos(), loadVideoIds()]);
   render();
   if (state.workouts.length) requestPersist();
 })();

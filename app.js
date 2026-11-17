@@ -28,32 +28,72 @@ function defaultState() {
   };
 }
 
+// Упражнения «на время» (кардио, планка): без веса и повторов
+const defaultKind = (name, group) => (group === 'Кардио' || name === 'Планка' ? 'time' : 'weight');
+
+function migrate(st) {
+  st = Object.assign(defaultState(), st);
+  st.exercises.forEach(e => { if (!e.kind) e.kind = defaultKind(e.name, e.group); });
+  return st;
+}
+
 function load() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return Object.assign(defaultState(), JSON.parse(raw));
+    if (raw) return migrate(JSON.parse(raw));
   } catch (e) { console.error(e); }
-  return defaultState();
+  return null;
 }
 
-let state = load();
-const save = () => localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+let state = load() || migrate({});
+let idbSaveTimer = null;
+
+// Основная копия — localStorage, запасная — IndexedDB (если одно хранилище потеряется, восстановимся из другого)
+function save() {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
+  catch (e) { console.error(e); alert('Не удалось сохранить данные: ' + e.message); }
+  clearTimeout(idbSaveTimer);
+  idbSaveTimer = setTimeout(() => idb('kv', 'readwrite', st => st.put(JSON.stringify(state), 'state')).catch(() => {}), 300);
+}
+
+// Если localStorage пуст, а в IndexedDB есть данные — восстанавливаем
+async function restoreFromBackupStore() {
+  if (localStorage.getItem(STORAGE_KEY)) return false;
+  try {
+    const raw = await idb('kv', 'readonly', st => st.get('state'));
+    if (!raw) return false;
+    state = migrate(JSON.parse(raw));
+    localStorage.setItem(STORAGE_KEY, raw);
+    return true;
+  } catch { return false; }
+}
+
+// Просим браузер не удалять данные при нехватке места
+async function requestPersist() {
+  try { return navigator.storage?.persist ? await navigator.storage.persist() : false; } catch { return false; }
+}
+
+const isStandalone = () => window.matchMedia?.('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIOS = () => /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
 const exById = id => state.exercises.find(e => e.id === id);
 const exName = id => (exById(id) || { name: 'Удалённое упражнение' }).name;
+const isTime = id => exById(id)?.kind === 'time';
 
 /* ================== Фото тренажёров (IndexedDB) ================== */
 
 const photoUrls = new Map(); // exId -> objectURL для показа
 
-function idb(mode, fn) {
+function idb(store, mode, fn) {
   return new Promise((resolve, reject) => {
-    const open = indexedDB.open('gym-photos', 1);
-    open.onupgradeneeded = () => open.result.createObjectStore('photos');
+    const open = indexedDB.open('gym-photos', 2);
+    open.onupgradeneeded = () => {
+      for (const name of ['photos', 'kv']) if (!open.result.objectStoreNames.contains(name)) open.result.createObjectStore(name);
+    };
     open.onerror = () => reject(open.error);
     open.onsuccess = () => {
-      const tx = open.result.transaction('photos', mode);
-      const req = fn(tx.objectStore('photos'));
+      const tx = open.result.transaction(store, mode);
+      const req = fn(tx.objectStore(store));
       tx.oncomplete = () => { open.result.close(); resolve(req?.result); };
       tx.onerror = () => reject(tx.error);
     };
@@ -61,22 +101,35 @@ function idb(mode, fn) {
 }
 
 async function photoEntries() {
-  const [keys, vals] = await Promise.all([idb('readonly', s => s.getAllKeys()), idb('readonly', s => s.getAll())]);
+  const [keys, vals] = await Promise.all([idb('photos', 'readonly', s => s.getAllKeys()), idb('photos', 'readonly', s => s.getAll())]);
   return keys.map((k, i) => [k, vals[i]]);
 }
 
-function setPhotoUrl(exId, blob) {
+const blobToDataUrl = blob => new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = rej; fr.readAsDataURL(blob); });
+const toBlob = async v => (typeof v === 'string' ? (await fetch(v)).blob() : v);
+
+async function setPhotoUrl(exId, value) {
   if (photoUrls.has(exId)) URL.revokeObjectURL(photoUrls.get(exId));
-  if (blob) photoUrls.set(exId, URL.createObjectURL(blob)); else photoUrls.delete(exId);
+  photoUrls.delete(exId);
+  if (value) photoUrls.set(exId, URL.createObjectURL(await toBlob(value)));
 }
 
+// Фото храним строкой (dataURL): Safari на iPhone иногда теряет Blob-объекты в IndexedDB
 async function savePhoto(exId, blob) {
-  await idb('readwrite', s => (blob ? s.put(blob, exId) : s.delete(exId)));
-  setPhotoUrl(exId, blob);
+  const value = blob ? await blobToDataUrl(blob) : null;
+  await idb('photos', 'readwrite', s => (value ? s.put(value, exId) : s.delete(exId)));
+  // проверяем, что действительно записалось
+  if (value && !(await idb('photos', 'readonly', s => s.get(exId)))) throw new Error('фото не записалось');
+  await setPhotoUrl(exId, value);
+}
+
+async function savePhotoSafe(exId, blob) {
+  try { await savePhoto(exId, blob); return true; }
+  catch (e) { alert('Не удалось сохранить фото: ' + (e.message || e)); return false; }
 }
 
 async function loadPhotos() {
-  try { for (const [k, v] of await photoEntries()) setPhotoUrl(k, v); }
+  try { for (const [k, v] of await photoEntries()) await setPhotoUrl(k, v); }
   catch (e) { console.error('Фото недоступны', e); }
 }
 
@@ -97,15 +150,27 @@ function shrinkImage(file, max = 1024) {
   });
 }
 
+// Поле выбора файла должно быть в документе: на iPhone «оторванное» поле иногда не сообщает о выбранном файле
+function filePicker(accept) {
+  document.querySelectorAll('input.file-picker').forEach(el => el.remove());
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = accept;
+  input.className = 'file-picker';
+  input.style.cssText = 'position:fixed;left:-1000px;opacity:0';
+  document.body.appendChild(input);
+  return input;
+}
+
 // Открывает выбор: камера или галерея (телефон сам предложит варианты)
 function pickImage() {
   return new Promise(resolve => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = 'image/*';
+    const input = filePicker('image/*');
     input.onchange = async () => {
-      if (!input.files[0]) return resolve(null);
-      try { resolve(await shrinkImage(input.files[0])); }
+      const file = input.files[0];
+      input.remove();
+      if (!file) return resolve(null);
+      try { resolve(await shrinkImage(file)); }
       catch { alert('Не удалось обработать фото.'); resolve(null); }
     };
     input.click();
@@ -145,6 +210,20 @@ const fmtDateShort = iso => new Date(iso).toLocaleDateString('ru-RU', { day: 'nu
 
 // Оценка одноповторного максимума (формула Эпли)
 const e1rm = (w, r) => (r <= 0 || w <= 0) ? 0 : (r === 1 ? w : w * (1 + r / 30));
+
+const setSeconds = s => Math.round(num(s.m) * 60 + num(s.s));
+function fmtTime(sec) {
+  if (!sec) return '—';
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  if (h) return `${h} ч ${m} мин`;
+  if (!s) return `${m} мин`;
+  return m ? `${m} мин ${s} с` : `${s} с`;
+}
+const fmtSet = (exId, s) => (isTime(exId) ? fmtTime(setSeconds(s)) : `${fmtNum(num(s.w))} кг × ${num(s.r)}`);
+const fmtSetShort = (exId, s) => (isTime(exId) ? fmtTime(setSeconds(s)) : `${fmtNum(num(s.w))}×${num(s.r)}`);
+// Подход заполнен — значит выполнен, даже если не нажали ✓
+const isFilled = (exId, s) => (isTime(exId) ? setSeconds(s) > 0 : num(s.r) > 0);
+const itemSeconds = it => doneSets(it).reduce((a, s) => a + setSeconds(s), 0);
 
 const doneSets = item => item.sets.filter(s => s.done);
 const workoutVolume = w => w.items.reduce((sum, it) => sum + doneSets(it).reduce((a, s) => a + num(s.w) * num(s.r), 0), 0);
@@ -197,7 +276,11 @@ function viewWorkout() {
         <button class="btn small danger" data-action="delete-template" data-id="${t.id}">✕</button>
       </div>`).join('');
     const last = state.workouts[state.workouts.length - 1];
-    return `
+    const warn = isIOS() && !isStandalone() ? `
+      <div class="card warn">⚠️ Приложение открыто во вкладке Safari. На iPhone у вкладки и у иконки на экране «Домой» <b>разные хранилища</b>,
+      а данные вкладки Safari может стереть через 7 дней без посещений. Установите приложение (Поделиться → «На экран „Домой“»)
+      и записывайте тренировки только через иконку.</div>` : '';
+    return `${warn}
       <button class="btn primary block" data-action="start-empty">＋ Начать тренировку</button>
       ${last ? `<p class="muted" style="text-align:center">Последняя: ${fmtDate(last.start)} · ${esc(last.name)}</p>` : ''}
       <div class="section-title">Шаблоны</div>
@@ -206,14 +289,19 @@ function viewWorkout() {
 
   const items = a.items.map((it, i) => {
     const prev = lastSetsFor(it.exId);
+    const timed = isTime(it.exId);
     const rows = it.sets.map((s, j) => {
       const p = prev && prev[j];
+      const prevTxt = p ? fmtSetShort(it.exId, p) : '—';
+      const fields = timed ? `
+          <td><input inputmode="numeric" placeholder="мин" value="${esc(s.m ?? '')}" data-field="m" data-i="${i}" data-j="${j}"></td>
+          <td><input inputmode="numeric" placeholder="сек" value="${esc(s.s ?? '')}" data-field="s" data-i="${i}" data-j="${j}"></td>` : `
+          <td><input inputmode="decimal" placeholder="кг" value="${esc(s.w ?? '')}" data-field="w" data-i="${i}" data-j="${j}"></td>
+          <td><input inputmode="numeric" placeholder="раз" value="${esc(s.r ?? '')}" data-field="r" data-i="${i}" data-j="${j}"></td>`;
       return `
         <tr class="${s.done ? 'done' : ''}">
           <td>${j + 1}</td>
-          <td class="prev">${p ? `${fmtNum(num(p.w))}×${num(p.r)}` : '—'}</td>
-          <td><input inputmode="decimal" placeholder="кг" value="${esc(s.w)}" data-field="w" data-i="${i}" data-j="${j}"></td>
-          <td><input inputmode="numeric" placeholder="раз" value="${esc(s.r)}" data-field="r" data-i="${i}" data-j="${j}"></td>
+          <td class="prev">${prevTxt}</td>${fields}
           <td><button class="check" data-action="toggle-set" data-i="${i}" data-j="${j}" aria-label="Выполнено">✓</button></td>
           <td><button class="del-set" data-action="del-set" data-i="${i}" data-j="${j}" aria-label="Удалить подход">×</button></td>
         </tr>`;
@@ -226,10 +314,10 @@ function viewWorkout() {
           <button class="btn small danger" data-action="remove-ex" data-i="${i}">Убрать</button>
         </div>
         <table class="sets">
-          <thead><tr><th>#</th><th>Прошлый</th><th>Вес</th><th>Повт.</th><th></th><th></th></tr></thead>
+          <thead><tr><th>#</th><th>Прошлый</th>${timed ? '<th>Мин</th><th>Сек</th>' : '<th>Вес</th><th>Повт.</th>'}<th></th><th></th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
-        <button class="btn ghost small" data-action="add-set" data-i="${i}">＋ Подход</button>
+        <button class="btn ghost small" data-action="add-set" data-i="${i}">＋ ${timed ? 'Ещё отрезок' : 'Подход'}</button>
       </div>`;
   }).join('');
 
@@ -257,19 +345,25 @@ function startWorkout(name, exIds = []) {
 }
 
 // Новое упражнение в тренировке: столько же подходов, сколько было в прошлый раз, с теми же весами
+const pick = (o, keys) => Object.fromEntries(keys.filter(k => o[k] !== undefined).map(k => [k, o[k]]));
+
 function newItem(exId) {
   const prev = lastSetsFor(exId);
-  const sets = prev ? prev.map(s => ({ w: s.w, r: s.r, done: false })) : [{ w: '', r: '', done: false }];
+  const blank = isTime(exId) ? { m: '', s: '' } : { w: '', r: '' };
+  const sets = prev ? prev.map(s => ({ ...blank, ...pick(s, Object.keys(blank)), done: false })) : [{ ...blank, done: false }];
   return { exId, sets };
 }
 
 function finishWorkout() {
   const a = state.active;
-  a.items = a.items.map(it => ({ ...it, sets: doneSets(it) })).filter(it => it.sets.length);
-  if (!a.items.length) {
-    if (confirm('Нет ни одного отмеченного подхода. Отменить тренировку?')) { state.active = null; save(); render(); }
+  const items = a.items
+    .map(it => ({ ...it, sets: it.sets.filter(s => s.done || isFilled(it.exId, s)).map(s => ({ ...s, done: true })) }))
+    .filter(it => it.sets.length);
+  if (!items.length) {
+    alert('Пока нечего сохранять: заполните хотя бы один подход (повторы или время).\n\nЕсли тренировка не нужна — нажмите «Отменить тренировку» внизу.');
     return;
   }
+  a.items = items;
   // Отмечаем рекорды
   const prs = [];
   for (const it of a.items) {
@@ -288,7 +382,7 @@ function finishWorkout() {
     <h2>Тренировка завершена 💪</h2>
     <div class="stats">
       <div class="stat"><strong>${fmtMinutes(new Date(a.end) - new Date(a.start))}</strong><span>время</span></div>
-      <div class="stat"><strong>${a.items.reduce((n, i) => n + i.sets.length, 0)}</strong><span>подходов</span></div>
+      <div class="stat"><strong>${a.items.reduce((n, i) => n + (isTime(i.exId) ? 0 : i.sets.length), 0)}</strong><span>подходов</span></div>
       <div class="stat"><strong>${fmtNum(workoutVolume(a))}</strong><span>кг объём</span></div>
     </div>
     ${prs.length ? `<div class="card"><span class="badge pr">🏆 Новый рекорд</span><div style="margin-top:6px">${prs.map(esc).join(', ')}</div></div>` : ''}
@@ -297,6 +391,7 @@ function finishWorkout() {
       <div class="row"><input id="tpl-name" value="${esc(a.name)}"><button class="btn primary" data-action="save-template" data-id="${a.id}">Сохранить</button></div>`}
     <button class="btn block" style="margin-top:12px" data-action="close-modal">Готово</button>`);
   setTab('history');
+  requestPersist();
 }
 
 /* ================== Выбор упражнения ================== */
@@ -399,7 +494,7 @@ function showWorkout(id) {
     ${w.items.map(it => `
       <div class="card">
         <div class="row">${photoUrls.has(it.exId) ? thumb(it.exId, 'thumb small') : ''}<h3 class="grow" style="margin:0">${esc(exName(it.exId))}</h3></div>
-        ${it.sets.map((s, j) => `<div class="row between"><span class="muted">Подход ${j + 1}</span><span>${fmtNum(num(s.w))} кг × ${num(s.r)}</span></div>`).join('')}
+        ${it.sets.map((s, j) => `<div class="row between"><span class="muted">${isTime(it.exId) ? (it.sets.length > 1 ? `Отрезок ${j + 1}` : 'Время') : `Подход ${j + 1}`}</span><span>${fmtSet(it.exId, s)}</span></div>`).join('')}
       </div>`).join('')}
     ${w.note ? `<div class="card"><div class="muted">Заметка</div>${esc(w.note)}</div>` : ''}
     <div class="row">
@@ -426,11 +521,33 @@ function viewProgress() {
   if (!used.includes(progressEx)) progressEx = used[0] || null;
 
   let chartHtml = '<div class="empty">Проведите первую тренировку, чтобы увидеть прогресс</div>';
-  if (progressEx) {
+  if (progressEx && isTime(progressEx)) {
+    const points = ws.map(w => {
+      const it = w.items.find(i => i.exId === progressEx);
+      return it && itemSeconds(it) ? { date: w.start, sec: itemSeconds(it) } : null;
+    }).filter(Boolean);
+    const best = points.reduce((b, p) => (p.sec > b.sec ? p : b), points[0] || { sec: 0 });
+    chartHtml = `
+      <div class="card">
+        ${progressSelect(used)}
+        ${points.length ? `
+        <div class="muted" style="margin:10px 0 4px">Время за тренировку, мин</div>
+        ${chartSvg(points.map(p => ({ x: p.date, y: p.sec / 60 })))}
+        <div class="row between" style="margin-top:8px"><span class="muted">Дольше всего</span>
+          <span><span class="badge pr">🏆</span> ${fmtTime(best.sec)} · ${fmtDateShort(best.date)}</span></div>
+        <div class="row between"><span class="muted">Всего</span><span>${fmtTime(points.reduce((a, p) => a + p.sec, 0))}</span></div>
+        <div class="row between"><span class="muted">Тренировок с упражнением</span><span>${points.length}</span></div>`
+        : '<div class="empty">Нет записей со временем</div>'}
+      </div>
+      <div class="section-title">Последние результаты</div>
+      ${points.slice(-6).reverse().map(p => `
+        <div class="list-item"><div class="grow"><div>${fmtDate(p.date)}</div></div><span>${fmtTime(p.sec)}</span></div>`).join('')}`;
+  } else if (progressEx) {
     const points = ws.map(w => {
       const it = w.items.find(i => i.exId === progressEx);
       if (!it) return null;
-      const sets = doneSets(it);
+      const sets = doneSets(it).filter(s => num(s.r) > 0);
+      if (!sets.length) return null;
       return {
         date: w.start,
         e1rm: Math.max(...sets.map(s => e1rm(num(s.w), num(s.r)))),
@@ -439,10 +556,11 @@ function viewProgress() {
         best: sets.reduce((b, s) => (e1rm(num(s.w), num(s.r)) > e1rm(num(b.w), num(b.r)) ? s : b), sets[0]),
       };
     }).filter(Boolean);
-    const best = points.reduce((b, p) => (p.e1rm > b.e1rm ? p : b), points[0]);
+    const best = points.reduce((b, p) => (p.e1rm > b.e1rm ? p : b), points[0] || {});
     chartHtml = `
       <div class="card">
-        <select data-action="progress-select">${used.map(id => `<option value="${id}" ${id === progressEx ? 'selected' : ''}>${esc(exName(id))}</option>`).join('')}</select>
+        ${progressSelect(used)}
+        ${points.length ? `
         <div class="muted" style="margin:10px 0 4px">Расчётный максимум на 1 повтор, кг</div>
         ${chartSvg(points.map(p => ({ x: p.date, y: p.e1rm })))}
         <div class="row between" style="margin-top:8px">
@@ -450,7 +568,8 @@ function viewProgress() {
           <span><span class="badge pr">🏆</span> ${fmtNum(num(best.best.w))} кг × ${num(best.best.r)} · ${fmtDateShort(best.date)}</span>
         </div>
         <div class="row between"><span class="muted">Макс. вес</span><span>${fmtNum(Math.max(...points.map(p => p.maxW)))} кг</span></div>
-        <div class="row between"><span class="muted">Тренировок с упражнением</span><span>${points.length}</span></div>
+        <div class="row between"><span class="muted">Тренировок с упражнением</span><span>${points.length}</span></div>`
+        : '<div class="empty">Нет записей с повторами</div>'}
       </div>
       <div class="section-title">Последние результаты</div>
       ${points.slice(-6).reverse().map(p => `
@@ -466,6 +585,8 @@ function viewProgress() {
     </div>
     ${chartHtml}`;
 }
+
+const progressSelect = used => `<select data-action="progress-select">${used.map(id => `<option value="${id}" ${id === progressEx ? 'selected' : ''}>${esc(exName(id))}</option>`).join('')}</select>`;
 
 function chartSvg(pts) {
   const W = 320, H = 200, pl = 34, pr = 10, pt = 10, pb = 24;
@@ -505,7 +626,7 @@ function viewExercises() {
         return `
           <div class="list-item">
             <button class="thumb-btn" data-action="photo" data-id="${e.id}" aria-label="Фото тренажёра">${thumb(e.id, 'thumb small')}</button>
-            <div class="grow"><div>${esc(e.name)}</div>${best ? `<div class="muted">лучший 1ПМ ≈ ${fmtNum(best)} кг</div>` : ''}</div>
+            <div class="grow"><div>${esc(e.name)}</div>${e.kind === 'time' ? '<div class="muted">на время</div>' : best ? `<div class="muted">лучший 1ПМ ≈ ${fmtNum(best)} кг</div>` : ''}</div>
             <button class="btn small" data-action="edit-exercise" data-id="${e.id}">✎</button>
           </div>`;
       }).join('');
@@ -521,6 +642,10 @@ function exerciseForm(ex, then = '') {
     <div class="stack">
       <div><label>Название</label><input id="ex-name" value="${esc(ex?.name || '')}" placeholder="Например, Жим Арнольда"></div>
       <div><label>Группа мышц</label><select id="ex-group">${GROUPS.map(g => `<option ${g === (ex?.group || pickerGroup) ? 'selected' : ''}>${g}</option>`).join('')}</select></div>
+      <div><label>Что записываем</label><select id="ex-kind">
+        <option value="weight" ${(ex?.kind || defaultKind('', ex?.group || pickerGroup)) === 'weight' ? 'selected' : ''}>Вес и повторы</option>
+        <option value="time" ${(ex?.kind || defaultKind('', ex?.group || pickerGroup)) === 'time' ? 'selected' : ''}>Только время</option>
+      </select></div>
       <div><label>Фото тренажёра</label><div id="form-photo"></div></div>
       <button class="btn primary block" data-action="save-exercise" data-id="${ex?.id || ''}" data-then="${then}">Сохранить</button>
       ${ex ? `<button class="btn danger block" data-action="delete-exercise" data-id="${ex.id}">Удалить упражнение</button>` : ''}
@@ -551,46 +676,65 @@ function openSettings() {
     </div>
     <div class="section-title">Данные</div>
     <p class="muted">Все данные хранятся только на этом устройстве. Делайте резервную копию, чтобы не потерять историю или перенести её на другой телефон.</p>
+    <div class="card" id="storage-info"><div class="muted">Проверяю хранилище…</div></div>
     <div class="stack">
       <button class="btn block" data-action="export">⬇ Скачать резервную копию</button>
       <button class="btn block" data-action="import">⬆ Восстановить из файла</button>
       <button class="btn danger block" data-action="reset">Удалить все данные</button>
       <button class="btn block" data-action="close-modal">Закрыть</button>
     </div>`);
+  storageInfo().then(html => { const el = $('#storage-info'); if (el) el.innerHTML = html; });
 }
 
-const blobToDataUrl = blob => new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(blob); });
+async function storageInfo() {
+  const persisted = await (navigator.storage?.persisted?.() ?? Promise.resolve(false)).catch(() => false);
+  let photos = 0;
+  try { photos = (await idb('photos', 'readonly', st => st.count())) || 0; } catch { /* нет доступа */ }
+  const last = state.settings.lastBackup;
+  const line = (k, v) => `<div class="row between"><span class="muted">${k}</span><span>${v}</span></div>`;
+  return line('Тренировок', state.workouts.length) + line('Фото тренажёров', photos)
+    + line('Запущено', isStandalone() ? 'как приложение ✓' : 'во вкладке браузера')
+    + line('Защита от очистки', persisted ? 'включена ✓' : 'нет')
+    + line('Резервная копия', last ? fmtDateShort(last) : 'ни разу');
+}
 
 async function exportData() {
   const photos = {};
-  try { for (const [k, v] of await photoEntries()) photos[k] = await blobToDataUrl(v); } catch { /* без фото */ }
+  try { for (const [k, v] of await photoEntries()) photos[k] = typeof v === 'string' ? v : await blobToDataUrl(v); } catch { /* без фото */ }
   const blob = new Blob([JSON.stringify({ ...state, photos }, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = `gym-backup-${new Date().toISOString().slice(0, 10)}.json`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  state.settings.lastBackup = new Date().toISOString();
+  save();
 }
 
 function importData() {
-  const input = document.createElement('input');
-  input.type = 'file';
-  input.accept = 'application/json,.json';
+  const input = filePicker('application/json,.json');
   input.onchange = async () => {
     try {
       const data = JSON.parse(await input.files[0].text());
       if (!Array.isArray(data.exercises) || !Array.isArray(data.workouts)) throw new Error('bad format');
       if (!confirm(`Найдено тренировок: ${data.workouts.length}. Заменить текущие данные?`)) return;
       const { photos = {}, ...rest } = data;
-      state = Object.assign(defaultState(), rest);
+      state = migrate(rest);
       save();
-      await idb('readwrite', s => s.clear());
-      [...photoUrls.keys()].forEach(k => setPhotoUrl(k, null));
-      for (const [k, url] of Object.entries(photos)) await savePhoto(k, await (await fetch(url)).blob());
+      await clearPhotos();
+      for (const [k, url] of Object.entries(photos)) {
+        await idb('photos', 'readwrite', st => st.put(url, k));
+        await setPhotoUrl(k, url);
+      }
       closeModal(); render();
     } catch { alert('Не удалось прочитать файл резервной копии.'); }
   };
   input.click();
+}
+
+async function clearPhotos() {
+  await idb('photos', 'readwrite', st => st.clear()).catch(() => {});
+  for (const k of [...photoUrls.keys()]) await setPhotoUrl(k, null);
 }
 
 /* ================== Модальное окно ================== */
@@ -620,7 +764,7 @@ const actions = {
     const s = state.active.items[d.i].sets[d.j];
     s.done = !s.done;
     save(); render();
-    if (s.done) startRest();
+    if (s.done && !isTime(state.active.items[d.i].exId)) startRest();
   },
   'remove-ex': d => { if (confirm('Убрать упражнение из тренировки?')) { state.active.items.splice(d.i, 1); save(); render(); } },
   'finish': finishWorkout,
@@ -646,13 +790,13 @@ const actions = {
   'new-exercise': d => exerciseForm(null, d.then),
   'edit-exercise': d => exerciseForm(exById(d.id)),
   'save-exercise': async d => {
-    const name = $('#ex-name').value.trim(), group = $('#ex-group').value;
+    const name = $('#ex-name').value.trim(), group = $('#ex-group').value, kind = $('#ex-kind').value;
     if (!name) return $('#ex-name').focus();
     let id = d.id;
-    if (id) Object.assign(exById(id), { name, group });
-    else { id = uid(); state.exercises.push({ id, name, group }); }
+    if (id) Object.assign(exById(id), { name, group, kind });
+    else { id = uid(); state.exercises.push({ id, name, group, kind }); }
     if (d.then === 'add' && state.active) state.active.items.push(newItem(id));
-    if (pendingPhoto !== undefined) await savePhoto(id, pendingPhoto);
+    if (pendingPhoto !== undefined) await savePhotoSafe(id, pendingPhoto);
     save(); closeModal(); render();
   },
   'delete-exercise': d => {
@@ -665,15 +809,15 @@ const actions = {
   'photo': async d => {
     if (photoUrls.has(d.id)) return showPhoto(d.id);
     const blob = await pickImage();
-    if (blob) { await savePhoto(d.id, blob); render(); }
+    if (blob && await savePhotoSafe(d.id, blob)) render();
   },
   'replace-photo': async d => {
     const blob = await pickImage();
-    if (blob) { await savePhoto(d.id, blob); render(); showPhoto(d.id); }
+    if (blob && await savePhotoSafe(d.id, blob)) { render(); showPhoto(d.id); }
   },
   'remove-photo': async d => {
     if (!confirm('Удалить фото?')) return;
-    await savePhoto(d.id, null); closeModal(); render();
+    await savePhotoSafe(d.id, null); closeModal(); render();
   },
   'form-photo': async d => { const b = await pickImage(); if (b) { pendingPhoto = b; renderFormPhoto(d.id); } },
   'form-photo-remove': d => { pendingPhoto = null; renderFormPhoto(d.id); },
@@ -683,10 +827,8 @@ const actions = {
   'import': importData,
   'reset': () => {
     if (!confirm('Точно удалить ВСЕ тренировки и упражнения?')) return;
-    state = defaultState(); save(); stopRest(); closeModal();
-    idb('readwrite', s => s.clear()).catch(() => {});
-    [...photoUrls.keys()].forEach(k => setPhotoUrl(k, null));
-    render();
+    state = migrate({}); save(); stopRest(); closeModal();
+    clearPhotos().finally(render);
   },
   'close-modal': closeModal,
 };
@@ -714,6 +856,7 @@ document.addEventListener('input', e => {
 
 document.addEventListener('change', e => {
   if (e.target.dataset.action === 'progress-select') { progressEx = e.target.value; render(); }
+  if (e.target.id === 'ex-group' && $('#ex-kind')) $('#ex-kind').value = e.target.value === 'Кардио' ? 'time' : 'weight';
 });
 
 // Секундомер тренировки
@@ -723,7 +866,13 @@ setInterval(() => {
 }, 1000);
 
 render();
-loadPhotos().then(render);
+(async () => {
+  if (await restoreFromBackupStore()) render();
+  else save(); // создаём запасную копию для уже существующих данных
+  await loadPhotos();
+  render();
+  if (state.workouts.length) requestPersist();
+})();
 
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
   navigator.serviceWorker.register('sw.js').catch(() => {});

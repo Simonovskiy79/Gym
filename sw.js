@@ -1,5 +1,5 @@
-const CACHE = 'gym-v5';
-const FILES = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icon.svg'];
+const CACHE = 'gym-v6';
+const FILES = ['./', 'index.html', 'styles.css', 'app.js', 'claude.js', 'manifest.webmanifest', 'icon.svg'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES)));

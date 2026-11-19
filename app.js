@@ -312,14 +312,15 @@ const setSeconds = s => Math.round(num(s.m) * 60 + num(s.s));
 function fmtTime(sec) {
   if (!sec) return '—';
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
-  if (h) return `${h} ч ${m} мин`;
+  if (h) return m ? `${h} ч ${m} мин` : `${h} ч`;
   if (!s) return `${m} мин`;
   return m ? `${m} мин ${s} с` : `${s} с`;
 }
 const fmtSet = (exId, s) => (isTime(exId) ? fmtTime(setSeconds(s)) : `${fmtNum(num(s.w))} кг × ${num(s.r)}`);
 const fmtSetShort = (exId, s) => (isTime(exId) ? fmtTime(setSeconds(s)) : `${fmtNum(num(s.w))}×${num(s.r)}`);
 // Подход заполнен — значит выполнен, даже если не нажали ✓
-const isFilled = (exId, s) => (isTime(exId) ? setSeconds(s) > 0 : num(s.r) > 0);
+// Подход «тронут», если в нём введено хоть одно число (подсказки серым не считаются)
+const isFilled = (exId, s) => (isTime(exId) ? `${s.m ?? ''}${s.s ?? ''}` : `${s.w ?? ''}${s.r ?? ''}`).trim() !== '';
 const itemSeconds = it => doneSets(it).reduce((a, s) => a + setSeconds(s), 0);
 
 const doneSets = item => item.sets.filter(s => s.done);
@@ -346,6 +347,7 @@ function bestFor(exId, workouts = state.workouts) {
 
 let tab = 'workout';
 const TITLES = { workout: 'Тренировка', history: 'История', progress: 'Прогресс', exercises: 'Упражнения' };
+const VIEWS = { workout: () => viewWorkout(), history: () => viewHistory(), progress: () => viewProgress(), exercises: () => viewExercises() };
 
 function setTab(t) {
   tab = t;
@@ -356,7 +358,7 @@ function setTab(t) {
 
 function render() {
   $('#title').textContent = TITLES[tab];
-  $('#view').innerHTML = { workout: viewWorkout, history: viewHistory, progress: viewProgress, exercises: viewExercises }[tab]();
+  $('#view').innerHTML = VIEWS[tab]();
 }
 
 /* ================== Вкладка «Тренировка» ================== */
@@ -367,7 +369,7 @@ function viewWorkout() {
     const tpl = state.templates.map(t => `
       <div class="list-item">
         <button class="grow" style="background:none;border:0;text-align:left;padding:0" data-action="start-template" data-id="${t.id}">
-          <div>${esc(t.name)}</div>
+          <div>${t.planId ? '<span class="badge plan">План</span> ' : ''}${esc(t.name)}</div>
           <div class="muted">${t.exIds.map(exName).map(esc).join(', ')}</div>
         </button>
         <button class="btn small danger" data-action="delete-template" data-id="${t.id}">✕</button>
@@ -384,7 +386,7 @@ function viewWorkout() {
     return `${warn}${backupWarn}
       <button class="btn primary block" data-action="start-empty">＋ Начать тренировку</button>
       ${last ? `<p class="muted" style="text-align:center">Последняя: ${fmtDate(last.start)} · ${esc(last.name)}</p>` : ''}
-      <div class="section-title">Шаблоны</div>
+      <div class="section-title">${state.plan ? 'План и шаблоны' : 'Шаблоны'}</div>
       ${tpl || '<div class="muted card">Шаблонов пока нет. Завершив тренировку, можно сохранить её как шаблон, чтобы в следующий раз начать в одно касание.</div>'}`;
   }
 
@@ -395,10 +397,10 @@ function viewWorkout() {
       const p = prev && prev[j];
       const prevTxt = p ? fmtSetShort(it.exId, p) : '—';
       const fields = timed ? `
-          <td><input inputmode="numeric" placeholder="мин" value="${esc(s.m ?? '')}" data-field="m" data-i="${i}" data-j="${j}"></td>
-          <td><input inputmode="numeric" placeholder="сек" value="${esc(s.s ?? '')}" data-field="s" data-i="${i}" data-j="${j}"></td>` : `
-          <td><input inputmode="decimal" placeholder="кг" value="${esc(s.w ?? '')}" data-field="w" data-i="${i}" data-j="${j}"></td>
-          <td><input inputmode="numeric" placeholder="раз" value="${esc(s.r ?? '')}" data-field="r" data-i="${i}" data-j="${j}"></td>`;
+          <td><input inputmode="numeric" placeholder="${esc(s.pm || 'мин')}" value="${esc(s.m ?? '')}" data-field="m" data-i="${i}" data-j="${j}"></td>
+          <td><input inputmode="numeric" placeholder="${esc(s.ps || 'сек')}" value="${esc(s.s ?? '')}" data-field="s" data-i="${i}" data-j="${j}"></td>` : `
+          <td><input inputmode="decimal" placeholder="${esc(s.pw || 'кг')}" value="${esc(s.w ?? '')}" data-field="w" data-i="${i}" data-j="${j}"></td>
+          <td><input inputmode="numeric" placeholder="${esc(s.pr || 'раз')}" value="${esc(s.r ?? '')}" data-field="r" data-i="${i}" data-j="${j}"></td>`;
       return `
         <tr class="${s.done ? 'done' : ''}">
           <td>${j + 1}</td>
@@ -411,10 +413,11 @@ function viewWorkout() {
       <div class="card">
         <div class="ex-head">
           <button class="thumb-btn" data-action="photo" data-id="${it.exId}" aria-label="Фото тренажёра">${thumb(it.exId)}</button>
-          <h3 class="grow">${esc(exName(it.exId))}</h3>
+          <div class="grow"><h3>${esc(exName(it.exId))}</h3>${it.target ? `<div class="target">🎯 ${esc(targetText(it.exId, it.target))}</div>` : ''}</div>
           ${techBtn(it.exId)}
           <button class="icon-btn" data-action="remove-ex" data-i="${i}" aria-label="Убрать упражнение">✕</button>
         </div>
+        ${it.target?.note ? `<div class="muted target-note">${esc(it.target.note)}</div>` : ''}
         <table class="sets">
           <thead><tr><th>#</th><th>Прошлый</th>${timed ? '<th>Мин</th><th>Сек</th>' : '<th>Вес</th><th>Повт.</th>'}<th></th><th></th></tr></thead>
           <tbody>${rows}</tbody>
@@ -434,13 +437,13 @@ function viewWorkout() {
     <button class="btn danger block" style="margin-top:12px" data-action="cancel-workout">Отменить тренировку</button>`;
 }
 
-function startWorkout(name, exIds = []) {
+function startWorkout(name, exIds = [], targets = null) {
   state.active = {
     id: uid(),
     name,
     start: new Date().toISOString(),
     note: '',
-    items: exIds.filter(exById).map(newItem),
+    items: exIds.filter(exById).map(id => newItem(id, targets?.[id])),
   };
   save();
   render();
@@ -449,17 +452,53 @@ function startWorkout(name, exIds = []) {
 // Новое упражнение в тренировке: столько же подходов, сколько было в прошлый раз, с теми же весами
 const pick = (o, keys) => Object.fromEntries(keys.filter(k => o[k] !== undefined).map(k => [k, o[k]]));
 
-function newItem(exId) {
-  const prev = lastSetsFor(exId);
-  const blank = isTime(exId) ? { m: '', s: '' } : { w: '', r: '' };
-  const sets = prev ? prev.map(s => ({ ...blank, ...pick(s, Object.keys(blank)), done: false })) : [{ ...blank, done: false }];
-  return { exId, sets };
+// Подсказки (серым) берём из плана, иначе из прошлой тренировки. Значения не подставляем:
+// подход считается сделанным, только когда вы нажали ✓ или ввели числа сами.
+function newItem(exId, target = null) {
+  const prev = lastSetsFor(exId) || [];
+  const timed = isTime(exId);
+  const n = Math.max(1, Math.min(20, Math.round(num(target?.sets)) || prev.length || 1));
+  const sets = Array.from({ length: n }, (_, j) => {
+    const p = prev[j] || prev[prev.length - 1] || {};
+    if (timed) {
+      const pm = target?.minutes != null && num(target.minutes) ? String(target.minutes) : (p.m ?? '');
+      return { m: '', s: '', pm, ps: target?.minutes != null ? '' : (p.s ?? ''), done: false };
+    }
+    const pw = target?.weight != null && target.weight !== '' ? String(target.weight) : (p.w ?? '');
+    const pr = target?.reps != null && target.reps !== '' ? String(target.reps) : (p.r ?? '');
+    return { w: '', r: '', pw, pr, done: false };
+  });
+  return target ? { exId, sets, target } : { exId, sets };
+}
+
+const firstNum = v => (String(v ?? '').match(/\d+(?:[.,]\d+)?/) || [''])[0].replace(',', '.');
+
+// ✓ без введённых чисел — принимаем подсказку
+function acceptPlaceholders(s, timed) {
+  if (timed) {
+    if (s.m === '' && s.s === '') { s.m = firstNum(s.pm); s.s = firstNum(s.ps); }
+  } else {
+    if (s.w === '' || s.w == null) s.w = firstNum(s.pw);
+    if (s.r === '' || s.r == null) s.r = firstNum(s.pr);
+  }
+}
+
+function targetText(exId, t) {
+  if (isTime(exId)) return [t.sets > 1 ? `${t.sets} отрезка` : '', t.minutes ? `${t.minutes} мин` : ''].filter(Boolean).join(' × ') || 'по плану';
+  const parts = [`${t.sets || '?'}×${t.reps || '?'}`];
+  if (t.weight != null && t.weight !== '') parts.push(`${t.weight} кг`);
+  if (t.rest) parts.push(`отдых ${t.rest >= 60 ? fmtDuration(t.rest * 1000) : t.rest + ' с'}`);
+  return parts.join(' · ');
 }
 
 function finishWorkout() {
   const a = state.active;
   const items = a.items
-    .map(it => ({ ...it, sets: it.sets.filter(s => s.done || isFilled(it.exId, s)).map(s => ({ ...s, done: true })) }))
+    .map(it => ({ ...it, sets: it.sets.filter(s => s.done || isFilled(it.exId, s)).map(s => {
+      const out = { ...s, done: true };
+      acceptPlaceholders(out, isTime(it.exId));
+      return out;
+    }) }))
     .filter(it => it.sets.length);
   if (!items.length) {
     alert('Пока нечего сохранять: заполните хотя бы один подход (повторы или время).\n\nЕсли тренировка не нужна — нажмите «Отменить тренировку» внизу.');
@@ -893,7 +932,7 @@ function closeModal() {
 
 const actions = {
   'start-empty': () => startWorkout(`Тренировка ${new Date().toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' })}`),
-  'start-template': d => { const t = state.templates.find(x => x.id === d.id); if (t) startWorkout(t.name, t.exIds); },
+  'start-template': d => { const t = state.templates.find(x => x.id === d.id); if (t) startWorkout(t.name, t.exIds, t.targets); },
   'delete-template': d => { if (confirm('Удалить шаблон?')) { state.templates = state.templates.filter(t => t.id !== d.id); save(); render(); } },
   'pick-exercise': openPicker,
   'picker-group': d => { pickerGroup = d.g; renderPicker(); },
@@ -902,16 +941,19 @@ const actions = {
     save(); closeModal(); render();
   },
   'add-set': d => {
-    const sets = state.active.items[d.i].sets, last = sets[sets.length - 1];
-    sets.push({ w: last?.w ?? '', r: last?.r ?? '', done: false });
+    const it = state.active.items[d.i], sets = it.sets, last = sets[sets.length - 1] || {};
+    sets.push(isTime(it.exId)
+      ? { m: '', s: '', pm: last.m || last.pm || '', ps: last.s || last.ps || '', done: false }
+      : { w: '', r: '', pw: last.w || last.pw || '', pr: last.r || last.pr || '', done: false });
     save(); render();
   },
   'del-set': d => { state.active.items[d.i].sets.splice(d.j, 1); save(); render(); },
   'toggle-set': d => {
-    const s = state.active.items[d.i].sets[d.j];
+    const it = state.active.items[d.i], s = it.sets[d.j], timed = isTime(it.exId);
     s.done = !s.done;
+    if (s.done) acceptPlaceholders(s, timed);
     save(); render();
-    if (s.done && !isTime(state.active.items[d.i].exId)) startRest();
+    if (s.done && !timed) startRest(num(it.target?.rest) || state.settings.rest);
   },
   'remove-ex': d => { if (confirm('Убрать упражнение из тренировки?')) { state.active.items.splice(d.i, 1); save(); render(); } },
   'finish': finishWorkout,
